@@ -1,13 +1,9 @@
 import os
-import io
 import re
 import json
-from io import BytesIO
 from datetime import datetime
-from pathlib import Path
 
 import requests
-from PIL import Image
 import streamlit as st
 from streamlit.components.v1 import html as st_html
 
@@ -20,14 +16,11 @@ except Exception:
     AzureKeyCredential = None
 
 # =========================
-# Page config — LITERATURE ONLY EDITION + TEMPLATE FILLER
+# Page config — LITERATURE ONLY EDITION (with content-filter fallback)
 # =========================
 st.set_page_config(page_title="Suvichaar Literature Insight", page_icon="📚", layout="centered")
 st.title("📚 Suvichaar — Literature Insight (Text & Poetry)")
-st.caption(
-    "Paste text or upload an image → OCR (if image) → Literary analysis JSON (devices, line-by-line, glossary) → "
-    "Optional: fill Literature AMP template placeholders and download."
-)
+st.caption("Paste text or upload an image → OCR (if image) → Safe, student-friendly literary analysis: literal meaning, figurative sense, devices, line-by-line notes, glossary.")
 
 # =========================
 # Secrets / Config
@@ -49,7 +42,7 @@ AZURE_DI_ENDPOINT = get_secret("AZURE_DI_ENDPOINT")
 AZURE_DI_KEY      = get_secret("AZURE_DI_KEY")
 
 if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_DEPLOYMENT):
-    st.warning("Add Azure OpenAI secrets in `.streamlit/secrets.toml` → AZURE_API_KEY, AZURE_ENDPOINT, AZURE_DEPLOYMENT.")
+    st.warning("Add Azure OpenAI secrets in `.streamlit/secrets.toml`: AZURE_API_KEY, AZURE_ENDPOINT, AZURE_DEPLOYMENT.")
 
 # =========================
 # Language helpers
@@ -65,21 +58,47 @@ def detect_hi_or_en(text: str) -> str:
     return "hi" if (devanagari / total) >= 0.25 else "en"
 
 # =========================
+# Local safety sanitization (PII/profanity/urls)
+# =========================
+_BAD_WORDS = {
+    # tiny classroom-safe mask list; extend if your OCR source is noisy
+    "damn", "hell", "ass", "bastard", "crap",
+    "sex", "sexy", "nude", "naked", "porn", "kill", "suicide"
+}
+
+def sanitize_locally(text: str) -> str:
+    t = text or ""
+    # Mask emails, phones, urls
+    t = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[email]", t)
+    t = re.sub(r"\+?\d[\d\s\-()]{7,}\d", "[phone]", t)
+    t = re.sub(r"(https?://|www\.)\S+", "[link]", t)
+    # Mask simple profanities/blocked terms (case-insensitive whole words)
+    def mask_bad(match):
+        w = match.group(0)
+        return w[0] + "*"*(max(len(w)-2,1)) + w[-1]
+    for w in _BAD_WORDS:
+        t = re.sub(rf"\b{re.escape(w)}\b", mask_bad, t, flags=re.IGNORECASE)
+    return t.strip()
+
+# =========================
 # Azure helpers
 # =========================
-def call_azure_chat(messages, *, temperature=0.1, max_tokens=2200):
-    """Call Azure Chat and return text content."""
+def call_azure_chat(messages, *, temperature=0.1, max_tokens=2200, force_json=True):
+    """Call Azure Chat and return (ok, content, status_code)."""
     headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
     url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions"
     params = {"api-version": AZURE_API_VERSION}
     body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    if force_json:
+        # Ask Azure to return a JSON object (helps avoid prefaces)
+        body["response_format"] = {"type": "json_object"}
     try:
         r = requests.post(url, headers=headers, params=params, json=body, timeout=120)
         if r.status_code != 200:
-            return False, f"Azure error {r.status_code}: {r.text[:300]}"
-        return True, r.json()["choices"][0]["message"]["content"]
+            return False, r.text[:400], r.status_code
+        return True, r.json()["choices"][0]["message"]["content"], r.status_code
     except Exception as e:
-        return False, f"Azure request failed: {e}"
+        return False, f"Azure request failed: {e}", 0
 
 # =========================
 # OCR (images / PDFs)
@@ -112,184 +131,70 @@ def ocr_read_any(bytes_blob: bytes) -> str:
         return ""
 
 # =========================
-# Literary analysis prompts
+# Prompts (safer, classroom-oriented)
 # =========================
-LIT_SYSTEM = (
-    "You are a veteran literature teacher and critic."
-    " Analyze input that may be a quote, proverb, stanza, or short poem."
-    " Be precise, student-friendly, and avoid over-interpretation."
+LIT_SYSTEM_SAFE = (
+    "You are a veteran literature teacher. Produce classroom-appropriate analysis for students."
+    " If the text contains sensitive or graphic material, generalize or soften it, avoid explicit detail, and"
+    " focus strictly on language, imagery, and literary devices."
 )
 
 LIT_JSON_SCHEMA = {
     "language": "en|hi",
     "text_type": "quote|prose|poetry",
-    "literal_meaning": "short plain-language paraphrase",
+    "literal_meaning": "plain-language paraphrase",
     "figurative_meaning": "themes, symbolism, deeper sense",
-    "speaker_or_voice": "who is speaking (if clear) or 'narrator'",
+    "speaker_or_voice": "speaker or narrator",
     "tone_mood": "tone words and mood",
     "devices": [
         {"name": "Simile|Metaphor|Personification|Alliteration|Hyperbole|Imagery|Rhyme|Anaphora|Symbolism|Consonance|Assonance|Onomatopoeia|Metonymy|Synecdoche|Pun",
          "evidence": "exact words from text",
          "explanation": "why this is that device"}
     ],
-    "word_by_word_defs": [
-        {"word": "...", "meaning": "literal + connotation"}
-    ],
-    "line_by_line": [
-        {"line": "original line text", "explanation": "one clear sentence"}
-    ],
+    "word_by_word_defs": [{"word": "...", "meaning": "literal + connotation"}],
+    "line_by_line": [{"line": "original line text", "explanation": "one clear sentence"}],
     "cultural_context": "notes if proverb/idiom/symbolic",
-    "vocabulary_glossary": [
-        {"term": "...", "meaning": "..."}
-    ],
-    "misconceptions": ["common misunderstanding(s) to avoid"],
-    "one_sentence_takeaway": "single-sentence summary a Grade 8 student can grasp",
-    "storytitle": "(optional) inferred short title",
-    "author": "(optional)"
+    "vocabulary_glossary": [{"term": "...", "meaning": "..."}],
+    "misconceptions": ["common misunderstanding(s)"],
+    "one_sentence_takeaway": "single-sentence summary"
 }
 
-EXAMPLE_USER_HINT = (
-    "If the text is like 'Your face is like Moon', identify SIMILE, explain 'face' (literal + figurative),"
-    " explain 'moon' (literal + cultural connotations), then give a simple takeaway."
+EXAMPLE_HINT = (
+    "If the text is like 'Your face is like Moon', identify SIMILE; explain 'face' (literal+figurative) and 'moon'"
+    " (literal + cultural connotations like beauty/serenity); keep analysis respectful and age-appropriate."
 )
 
 PROMPT_FMT = f"""
-Return ONLY a valid JSON object with these keys (omit any that don't apply). Keep quotes from the text verbatim under 'evidence'.
-Schema (English keys, values in the text language if possible):
+Return ONLY a valid JSON object (minified) with these keys. Keep quotes from the text verbatim under 'evidence'.
+Schema (English keys, values in the explanation language):
 {json.dumps(LIT_JSON_SCHEMA, ensure_ascii=False, indent=2)}
 
 Guidelines:
-- If it's poetry, fill 'line_by_line' with each line and a short explanation.
-- If it's a single-line quote or aphorism, still analyze devices and meanings.
-- Be concise but clear. Prefer 3–6 bullet items for 'devices'.
-- Avoid moralizing; stick to what the words support.
-- {EXAMPLE_USER_HINT}
+- Classroom-safe wording. Remove explicit detail if any appears; keep to literary aspects.
+- For poetry, fill 'line_by_line' for each line.
+- Be concise (3–6 items under 'devices'), and avoid moralizing.
+- {EXAMPLE_HINT}
 """
-
-# =========================
-# Template filler helpers (maps analysis → AMP placeholders)
-# =========================
-def split_lines_for_template(text: str, max_lines: int = 6):
-    # keep non-empty trimmed lines only
-    raw_lines = [ln.strip() for ln in (text or "").splitlines()]
-    lines = [ln for ln in raw_lines if ln]
-    return lines[:max_lines]
-
-def build_template_payload(analysis: dict, *, source_text: str, meta_overrides: dict | None = None) -> dict:
-    """Create a dict with all placeholders expected by the Literature AMP template."""
-    p = {}
-    meta_overrides = meta_overrides or {}
-
-    # Meta
-    p["storytitle"] = meta_overrides.get("storytitle") or analysis.get("storytitle") or "Literature Notes"
-    p["author"] = meta_overrides.get("author") or analysis.get("author") or ""
-    p["grade_level"] = meta_overrides.get("grade_level") or ""
-    p["text_type"] = analysis.get("text_type") or ("poetry" if "\n" in source_text else "quote")
-
-    # Text lines (max 6)
-    lines = split_lines_for_template(source_text, 6)
-    for i in range(6):
-        key = f"line{i+1}"
-        p[key] = lines[i] if i < len(lines) else ""
-
-    # Line-by-line explanations
-    lbl = analysis.get("line_by_line") or []
-    for i in range(6):
-        p[f"line{i+1}_explanation"] = (lbl[i].get("explanation") if i < len(lbl) else "") if isinstance(lbl, list) else ""
-
-    # Literal / Figurative / Theme
-    p["literal_meaning"] = analysis.get("literal_meaning", "")
-    p["figurative_meaning"] = analysis.get("figurative_meaning", "")
-    p["theme"] = analysis.get("figurative_meaning", "")  # fallback
-    p["cultural_context"] = analysis.get("cultural_context", "")
-    p["one_sentence_takeaway"] = analysis.get("one_sentence_takeaway", "")
-
-    # Devices up to 6
-    devs = analysis.get("devices") or []
-    for i in range(6):
-        d = devs[i] if i < len(devs) else {}
-        p[f"device{i+1}_name"] = d.get("name", "") if isinstance(d, dict) else ""
-        p[f"device{i+1}_evidence"] = d.get("evidence", "") if isinstance(d, dict) else ""
-        p[f"device{i+1}_explanation"] = d.get("explanation", "") if isinstance(d, dict) else ""
-
-    # Vocabulary up to 6
-    gl = analysis.get("vocabulary_glossary") or []
-    for i in range(6):
-        g = gl[i] if i < len(gl) else {}
-        p[f"vocab{i+1}_term"] = g.get("term", "") if isinstance(g, dict) else ""
-        p[f"vocab{i+1}_meaning"] = g.get("meaning", "") if isinstance(g, dict) else ""
-
-    # Misconceptions up to 3
-    mis = analysis.get("misconceptions") or []
-    p["mis1"] = mis[0] if len(mis) > 0 else ""
-    p["mis2"] = mis[1] if len(mis) > 1 else ""
-    p["mis3"] = mis[2] if len(mis) > 2 else ""
-
-    # Media placeholders (left empty; user can fill)
-    for i in range(1, 13):
-        p.setdefault(f"s{i}image1", "")
-        p.setdefault(f"s{i}audio1", "")
-
-    # Other meta commonly used in your stories
-    p.setdefault("publisher_name", "Suvichaar Stories")
-    p.setdefault("publisher_logo", "")
-    p.setdefault("portraitcoverurl", "")
-    p.setdefault("canonical_url", "")
-    p.setdefault("next_link", "")
-    return p
-
-def fill_template_strict(template: str, data: dict):
-    """Replace {{key}} (and {{key|safe}}) with str(value). Return filled HTML and set of found placeholders."""
-    placeholders = set(re.findall(r"\{\{\s*([a-zA-Z0-9_\-]+)(?:\|safe)?\s*\}\}", template))
-    out = template
-    for k in placeholders:
-        val = str(data.get(k, ""))
-        out = out.replace(f"{{{{{k}}}}}", val).replace(f"{{{{{k}|safe}}}}", val)
-    return out, placeholders
 
 # =========================
 # UI — Inputs
 # =========================
 st.markdown("### 📥 Input")
-text_input = st.text_area(
-    "Paste a quote or poem (optional)",
-    height=160,
-    placeholder="e.g., Your face is like Moon\nI pedal and I ride…",
-)
-files = st.file_uploader(
-    "Or upload an image/PDF containing the text",
-    type=["jpg", "jpeg", "png", "webp", "tiff", "pdf"],
-    accept_multiple_files=False,
-)
-lang_choice = st.selectbox("Target explanation language", ["Auto-detect", "English", "Hindi"], index=0)
-
-# Optional meta for template
-with st.expander("🧾 Optional metadata for template", expanded=False):
-    meta_cols = st.columns(3)
-    meta_title = meta_cols[0].text_input("Story title override", "")
-    meta_author = meta_cols[1].text_input("Author (if known)", "")
-    meta_grade = meta_cols[2].text_input("Grade level (e.g., Grade 2)", "")
+text_input = st.text_area("Paste a quote or poem (optional)", height=140, placeholder="e.g., Your face is like Moon")
+file = st.file_uploader("Or upload an image/PDF containing the text", type=["jpg","jpeg","png","webp","tiff","pdf"], accept_multiple_files=False)
+lang_choice = st.selectbox("Target explanation language", ["Auto-detect","English","Hindi"], index=0)
 
 show_devices_table = st.toggle("Show literary devices table", value=True)
 show_line_by_line = st.toggle("Show line-by-line explanation (if poetry)", value=True)
 
-# Template upload and preview
-with st.expander("🧩 Upload Literature AMP template (optional)", expanded=False):
-    tpl_file = st.file_uploader(
-        "Upload your Literature AMP HTML template",
-        type=["html", "htm"],
-        accept_multiple_files=False,
-        key="tpl",
-    )
-
 run = st.button("🔎 Analyze")
 
 if run:
-    # Gather source text
+    # Source text
     source_text = (text_input or "").strip()
-    if files and not source_text:
+    if file and not source_text:
         with st.spinner("Running OCR on uploaded file…"):
-            blob = files.read()
+            blob = file.read()
             ocr_text = ocr_read_any(blob)
             if ocr_text:
                 source_text = ocr_text
@@ -306,46 +211,66 @@ if run:
 
     # Language
     detected = detect_hi_or_en(source_text)
-    if lang_choice == "English":
-        explain_lang = "en"
-    elif lang_choice == "Hindi":
-        explain_lang = "hi"
-    else:
-        explain_lang = detected
-
+    explain_lang = "en" if lang_choice == "English" else ("hi" if lang_choice == "Hindi" else detected)
     st.info(f"Explanation language: **{explain_lang}** (detected: {detected})")
 
-    # Build messages
-    system_msg = LIT_SYSTEM + (" Explain primarily in Hindi." if explain_lang.startswith("hi") else " Explain primarily in English.")
+    # Build safe messages
+    system_msg = LIT_SYSTEM_SAFE + (" Explain primarily in Hindi." if explain_lang.startswith("hi") else " Explain primarily in English.")
 
+    # 1) Primary attempt on locally-sanitized text
+    sanitized_text = sanitize_locally(source_text)
     user_msg = (
-        f"TEXT TO ANALYZE (verbatim):\n{source_text}\n\n"
+        f"TEXT TO ANALYZE (verbatim but classroom-safe):\n{sanitized_text}\n\n"
         f"{PROMPT_FMT}\n"
         "Output strictly as minified JSON. No preface, no code fences."
     )
 
     with st.spinner("Calling Azure OpenAI for literary analysis…"):
-        ok, content = call_azure_chat(
-            [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-            temperature=0.1,
-            max_tokens=2200,
+        ok, content, code = call_azure_chat(
+            [{"role": "system", "content": system_msg},
+             {"role": "user", "content": user_msg}],
+            temperature=0.1, max_tokens=2200, force_json=True
         )
 
+    # 2) If a policy block (HTTP 400), retry with an educational rewrite first
+    if (not ok) and code == 400:
+        st.warning("Azure content filter flagged the prompt. Retrying with an educational rewrite…")
+        safe_rewrite_prompt = (
+            "Rewrite the following into a classroom-appropriate, non-explicit paraphrase that preserves literary devices "
+            "and overall meaning. Remove any sensitive detail, PII, slurs, or explicit content. Return ONLY the rewritten text.\n\n"
+            f"TEXT:\n{sanitized_text}"
+        )
+        ok_rewrite, safe_text, _ = call_azure_chat(
+            [{"role": "system", "content": "You are a teacher rewriting text for children; keep it respectful and safe."},
+             {"role": "user", "content": safe_rewrite_prompt}],
+            temperature=0.2, max_tokens=800, force_json=False
+        )
+        if ok_rewrite:
+            # Now analyze the rewritten text
+            user_msg2 = (
+                f"TEXT TO ANALYZE (rewritten for classroom):\n{safe_text.strip()}\n\n"
+                f"{PROMPT_FMT}\n"
+                "Output strictly as minified JSON. No preface, no code fences."
+            )
+            ok, content, code = call_azure_chat(
+                [{"role": "system", "content": system_msg},
+                 {"role": "user", "content": user_msg2}],
+                temperature=0.1, max_tokens=2200, force_json=True
+            )
+
     if not ok:
-        st.error(content)
+        st.error(f"Azure request failed or was filtered.\n\nDetails:\nHTTP {code}\n{content}")
         st.stop()
 
-    # Try to parse JSON out of the reply
+    # Parse JSON
     def robust_parse(s: str):
         try:
             return json.loads(s)
         except Exception:
             m = re.search(r"\{[\s\S]*\}", s)
             if m:
-                try:
-                    return json.loads(m.group(0))
-                except Exception:
-                    return None
+                try: return json.loads(m.group(0))
+                except Exception: return None
             return None
 
     data = robust_parse(content) or {}
@@ -353,8 +278,8 @@ if run:
         st.error("Model did not return valid JSON. Raw reply (truncated):\n" + content[:800])
         st.stop()
 
-    # Top cards
-    st.success("✅ Analysis ready")
+    # === Render ===
+    st.success("✅ Analysis ready (classroom-safe)")
     cols = st.columns(2)
     with cols[0]:
         st.markdown("**Literal meaning**")
@@ -371,27 +296,22 @@ if run:
         st.markdown("**One-sentence takeaway**")
         st.write(data.get("one_sentence_takeaway", "—"))
 
-    # Word-by-word
     wbw = data.get("word_by_word_defs") or []
     if wbw:
         st.markdown("### 🧩 Word-by-word meanings & connotations")
-        st.table([{"word": w.get("word", ""), "meaning": w.get("meaning", "")} for w in wbw])
+        st.table([{"word": w.get("word",""), "meaning": w.get("meaning","")} for w in wbw])
 
-    # Devices
     if show_devices_table:
         devices = data.get("devices") or []
         st.markdown("### 🎭 Literary devices")
         if devices:
-            st.table(
-                [
-                    {"device": d.get("name", ""), "evidence": d.get("evidence", ""), "why": d.get("explanation", "")}
-                    for d in devices
-                ]
-            )
+            st.table([
+                {"device": d.get("name",""), "evidence": d.get("evidence",""), "why": d.get("explanation","")}
+                for d in devices
+            ])
         else:
             st.info("No clear devices detected.")
 
-    # Line by line (poetry)
     if show_line_by_line and (data.get("text_type") == "poetry" or data.get("line_by_line")):
         st.markdown("### 📖 Line-by-line explanation")
         for i, item in enumerate(data.get("line_by_line", []), start=1):
@@ -399,7 +319,6 @@ if run:
             st.write(item.get("explanation", ""))
             st.divider()
 
-    # Glossary & misconceptions
     gl = data.get("vocabulary_glossary") or []
     if gl:
         st.markdown("### 📒 Glossary")
@@ -410,47 +329,9 @@ if run:
         st.markdown("### ⚠️ Misconceptions to avoid")
         st.write("\n".join(f"• {m}" for m in mc))
 
-    # -------- Build template payload and optionally fill uploaded template --------
-    st.markdown("## 🏗️ Template payload")
-    meta_overrides = {
-        "storytitle": meta_title.strip() or None,
-        "author": meta_author.strip() or None,
-        "grade_level": meta_grade.strip() or None,
-    }
-    payload = build_template_payload(data, source_text=source_text, meta_overrides=meta_overrides)
-    st.json(payload, expanded=False)
-
-    # Download payload JSON
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button(
-        "⬇️ Download template JSON",
-        data=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
-        file_name=f"literature_template_payload_{ts}.json",
-        mime="application/json",
-    )
-
-    # If a template is uploaded, fill it and offer download + preview
-    if tpl_file is not None:
-        try:
-            raw_html = tpl_file.read().decode("utf-8", errors="replace")
-            filled_html, found = fill_template_strict(raw_html, payload)
-            st.success(f"Template filled. Placeholders detected: {len(found)}")
-
-            st.download_button(
-                "⬇️ Download filled HTML",
-                data=filled_html.encode("utf-8"),
-                file_name=f"literature_story_{ts}.html",
-                mime="text/html",
-            )
-
-            with st.expander("👀 Inline preview"):
-                st_html(filled_html, height=800, scrolling=True)
-        except Exception as e:
-            st.error(f"Template fill failed: {e}")
-
-    # Raw JSON (analysis)
     with st.expander("🔧 Debug / Raw analysis JSON"):
         st.json(data, expanded=False)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         st.download_button(
             "⬇️ Download analysis JSON",
             data=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
